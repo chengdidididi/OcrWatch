@@ -15,18 +15,22 @@ class NewImageHandler(FileSystemEventHandler):
         self.queue = queue
         self._last_processed = {}
 
+    #override了创建时方法
     def on_created(self, event):
+        #过滤出图片文件、通过lastprocessed检测防抖处理
         if not event.is_directory and event.src_path.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
             current_time = time.time()
             if event.src_path in self._last_processed:
                 if current_time - self._last_processed[event.src_path] < 2.0:
                     return
             
+            #使用asyncio的call_soon_threadsafe跨线程访问异步队列
+            #使用了asyncio的put_nowait将图片后缀的文件路径event.src_path非阻塞入队
             self._last_processed[event.src_path] = current_time
             self.loop.call_soon_threadsafe(self.queue.put_nowait, event.src_path)
 
+# 构造请求头将动态传入的凭据拼接到认证字段中
 def process_ocr_sync(file_path, token):
-    # 构造请求头将动态传入的凭据拼接到认证字段中
     try:
         with open(file_path, "rb") as file:
             file_bytes = file.read()
@@ -66,6 +70,7 @@ async def init_db(db_path):
         """)
         await db.commit()
 
+# 遍历版面分析结果，提取并拼接所有Markdown格式的纯文本，丢弃坐标与图片数据
 def extract_text_from_result(result_dict):
     if not result_dict or "layoutParsingResults" not in result_dict:
         return ""
@@ -77,8 +82,9 @@ def extract_text_from_result(result_dict):
     
     return "\n".join(full_text)
 
+# 挂载凭据参数以供同步请求函数调用
 async def ocr_worker(queue, db_path, on_success_callback, token):
-    # 挂载凭据参数以供同步请求函数调用
+    
     while True:
         try:
             file_path = await queue.get()
@@ -109,8 +115,9 @@ async def ocr_worker(queue, db_path, on_success_callback, token):
         except Exception as e:
             print(f"处理任务时发生错误: {e}")
 
+# 接收顶级入口下发的凭据并分发给消费者协程
 async def run_backend(watch_dir, db_path, token, on_success_callback=None):
-    # 接收顶级入口下发的凭据并分发给消费者协程
+    
     os.makedirs(watch_dir, exist_ok=True)
     await init_db(db_path)
 

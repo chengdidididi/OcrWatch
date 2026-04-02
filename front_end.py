@@ -165,25 +165,29 @@ QProgressBar::chunk {
 
 
 class ImagePreviewLabel(QLabel):
-    # 承载原始图像并执行自适应比例缩放渲染
+    #继承QLabel，实现图像渲染和缩放
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._raw_pixmap = None
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("background-color: #f1f3f4; border-radius: 8px; color: #9aa0a6;")
+        #控件在各方向上占据最大空间、同时强制接管最小尺寸，使控件尺寸变化时图像能随之变化
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(1, 1)
         
     def setPixmap(self, pixmap):
+        #override了QLabel的setPixmap方法，对图片对象调用_scale_and_render
         self._raw_pixmap = pixmap
         self._scale_and_render()
 
     def resizeEvent(self, event):
+        #override了QLabel的resizeEvent方法，重绘图片回传父类
         if self._raw_pixmap:
             self._scale_and_render()
         super().resizeEvent(event)
 
     def _scale_and_render(self):
+        #按比例、抗锯齿地缩放原始图片至控件尺寸self.size()，并调用父类的setPixmap方法贴到控件里
         if not self._raw_pixmap or self._raw_pixmap.isNull():
             return
         scaled_pixmap = self._raw_pixmap.scaled(
@@ -222,11 +226,14 @@ class OCRMainWindow(QMainWindow):
         self.tabs.addTab(self.tab_progress, "处理进度与日志")
         self.tabs.addTab(self.tab_settings, "设置")
 
+        #实例化系统托盘
         self._setup_system_tray()
         
+        #绑定托盘激活事件
         self.thumbnail_list.itemClicked.connect(self._on_item_clicked)
         self.thumbnail_list.itemDoubleClicked.connect(self._on_item_double_clicked)
         
+        #启动时执行一次加载检查，当前无路径会直接返回空列表
         self.load_data_from_db()
 
     def _load_config(self):
@@ -241,7 +248,7 @@ class OCRMainWindow(QMainWindow):
         return default_config
 
     def _save_config(self):
-        # 提取当前三个输入框的内容并覆盖写入磁盘配置文件
+        # 提取当前三个输入框的内容并覆盖写入config.json
         self.db_path = self.le_db_path.text()
         self.image_dir = self.le_watch_dir.text()
         self.api_token = self.le_api_token.text()
@@ -258,6 +265,7 @@ class OCRMainWindow(QMainWindow):
             print(f"保存配置文件失败: {e}")
 
     @Slot(str)
+    # 定义槽函数，用于在进度界面追加日志文本
     def append_log(self, text):
         # 驱动进度界面的光标移动并插入增量文本
         cursor = self.log_output.textCursor()
@@ -267,6 +275,7 @@ class OCRMainWindow(QMainWindow):
         self.log_output.ensureCursorVisible()
 
     def _init_ocr_tab(self):
+        # 初始化 OCR 结果选项卡，构建左右分割的布局结构
         self.tab_ocr = QWidget()
         layout = QVBoxLayout(self.tab_ocr)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -293,6 +302,7 @@ class OCRMainWindow(QMainWindow):
         middle_layout.addWidget(self.raw_text_edit, 1)
         splitter.addWidget(middle_container)
 
+        #右侧的富文本渲染，嵌入chromuim处理LaTex
         self.html_view = QWebEngineView()
         self.html_view.setHtml("<body style='font-family: sans-serif; color: #a0a0a0; padding: 20px;'>这里将渲染富文本排版...</body>")
         splitter.addWidget(self.html_view)
@@ -419,6 +429,7 @@ class OCRMainWindow(QMainWindow):
         self.tray_icon.show()
 
     def _on_tray_icon_activated(self, reason):
+        # 处理托盘图标点击事件，实现主窗口的显示与隐藏切换
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             if self.isVisible():
                 self.hide()
@@ -427,6 +438,7 @@ class OCRMainWindow(QMainWindow):
                 self.activateWindow()
 
     def closeEvent(self, event):
+        # override关闭事件，使窗口关闭时仅执行隐藏操作而非完全退出
         event.ignore()
         self.hide()
 
@@ -477,6 +489,7 @@ class OCRMainWindow(QMainWindow):
         self._refresh_current_view()
         
     def _refresh_current_view(self):
+        # 强制重新触发当前选中项的点击回调以刷新显示内容
         current_item = self.thumbnail_list.currentItem()
         if current_item:
             self._on_item_clicked(current_item)
@@ -522,6 +535,7 @@ class OCRMainWindow(QMainWindow):
                 self.image_preview.setText("源文件已丢失")
 
     def _on_item_double_clicked(self, item):
+        # 列表项双击回调：调用操作系统默认程序打开原始图片文件
         data = item.data(Qt.ItemDataRole.UserRole)
         if data and "image_path" in data and os.path.exists(data["image_path"]):
             os.startfile(data["image_path"])
