@@ -1,13 +1,16 @@
 import asyncio
+import json
 import os
-import base64
-import requests
+import aiohttp
 import aiosqlite
 import time
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-API_URL = "https://99j5u47emfs4r2l5.aistudio-app.com/layout-parsing"
+JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+MODEL = "PaddleOCR-VL-1.6"
+MAX_POLL_SECONDS = 300  # 轮询超时上限（秒）
+POLL_INTERVAL = 2      # 每次轮询间隔（秒）
 
 class NewImageHandler(FileSystemEventHandler):
     def __init__(self, loop, queue):
@@ -29,30 +32,120 @@ class NewImageHandler(FileSystemEventHandler):
             self._last_processed[event.src_path] = current_time
             self.loop.call_soon_threadsafe(self.queue.put_nowait, event.src_path)
 
-# 构造请求头将动态传入的凭据拼接到认证字段中
-def process_ocr_sync(file_path, token):
+# 异步方式提交OCR作业并轮询结果（1.6 作业提交+轮询模式）
+async def process_ocr_async(file_path, token):
     try:
-        with open(file_path, "rb") as file:
-            file_bytes = file.read()
-            file_data = base64.b64encode(file_bytes).decode("ascii")
+        if not os.path.exists(file_path):
+            print(f"错误: 文件不存在 {file_path}")
+            return None
 
         headers = {
-            "Authorization": f"token {token}",
-            "Content-Type": "application/json"
+            "Authorization": f"bearer {token}",
         }
-        
-        payload = {
-            "file": file_data,
-            "fileType": 1,
+        optional_payload = {
             "useDocOrientationClassify": False,
             "useDocUnwarping": False,
             "useChartRecognition": False,
         }
 
-        response = requests.post(API_URL, json=payload, headers=headers)
-        if response.status_code != 200:
+        # 提交作业（本地文件模式）— 使用 aiohttp 真正异步上传
+        # 先同步读取文件内容（截图文件较小，不会阻塞事件循环）
+        with open(file_path, "rb") as f:
+            file_content = f.read()
+
+        data = aiohttp.FormData()
+        data.add_field("model", MODEL)
+        data.add_field("optionalPayload", json.dumps(optional_payload))
+        data.add_field(
+            "file",
+            file_content,
+            filename=os.path.basename(file_path),
+            content_type="application/octet-stream",
+        )
+
+        async with aiohttp.ClientSession() as session:
+            # ---- 提交作业 ----
+            async with session.post(JOB_URL, headers=headers, data=data) as job_resp:
+                # 文件已上传，先读取响应文本
+                resp_text = await job_resp.text()
+                if job_resp.status != 200:
+                    print(f"提交作业失败 [{job_resp.status}]: {resp_text}")
+                    return None
+                try:
+                    job_json = json.loads(resp_text)
+                except json.JSONDecodeError:
+                    print(f"提交作业返回非法JSON: {resp_text[:500]}")
+                    return None
+
+            jobId = job_json.get("data", {}).get("jobId")
+            if not jobId:
+                print(f"提交作业响应缺少 jobId，完整响应: {resp_text[:500]}")
+                return None
+            print(f"作业已提交, job id: {jobId}")
+
+            # ---- 轮询作业状态 ----
+            start_time = time.monotonic()
+            while True:
+                elapsed = time.monotonic() - start_time
+                if elapsed > MAX_POLL_SECONDS:
+                    print(f"轮询超时（{MAX_POLL_SECONDS}秒），作业可能仍在处理中, job id: {jobId}")
+                    return None
+
+                async with session.get(f"{JOB_URL}/{jobId}", headers=headers) as poll_resp:
+                    if poll_resp.status != 200:
+                        poll_text = await poll_resp.text()
+                        print(f"查询作业状态失败 [{poll_resp.status}]: {poll_text[:300]}")
+                        return None
+                    jr_json = await poll_resp.json()
+
+                state = jr_json.get("data", {}).get("state", "unknown")
+
+                if state == "pending":
+                    print(f"作业状态: pending （已等待 {elapsed:.0f}s）")
+                elif state == "running":
+                    try:
+                        progress = jr_json["data"]["extractProgress"]
+                        print(f"作业状态: running, 总页数: {progress.get('totalPages', '?')}, "
+                              f"已提取: {progress.get('extractedPages', '?')}")
+                    except KeyError:
+                        print("作业状态: running...")
+                elif state == "done":
+                    jsonl_url = jr_json["data"]["resultUrl"]["jsonUrl"]
+                    print(f"作业完成, 正在下载结果...")
+                    break
+                elif state == "failed":
+                    error_msg = jr_json["data"].get("errorMsg", "未知错误")
+                    print(f"作业失败: {error_msg}")
+                    return None
+                else:
+                    print(f"作业状态未知: {state}, 响应: {json.dumps(jr_json, ensure_ascii=False)[:300]}")
+
+                await asyncio.sleep(POLL_INTERVAL)
+
+            # ---- 下载 JSONL 结果 ----
+            async with session.get(jsonl_url) as jsonl_resp:
+                if jsonl_resp.status != 200:
+                    print(f"下载结果失败 [{jsonl_resp.status}]")
+                    return None
+                jsonl_text = await jsonl_resp.text()
+
+            lines = jsonl_text.strip().split("\n")
+            # JSONL 每行一个 JSON 对象，结构为 {"result": {...}}，与旧版 API 返回一致
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    line_obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                result = line_obj.get("result")
+                if result and "layoutParsingResults" in result:
+                    return result
+
+            print("JSONL 结果中未找到有效的 layoutParsingResults")
             return None
-        return response.json().get("result")
+
     except Exception as e:
         print(f"请求失败: {e}")
         return None
@@ -82,15 +175,16 @@ def extract_text_from_result(result_dict):
     
     return "\n".join(full_text)
 
-# 挂载凭据参数以供同步请求函数调用
+# 异步消费者协程：从队列取文件路径 → 异步调用OCR → 存库
 async def ocr_worker(queue, db_path, on_success_callback, token):
     
     while True:
+        file_path = None
         try:
             file_path = await queue.get()
             print(f"检测到新截图，开始识别: {file_path}")
             
-            raw_result = await asyncio.to_thread(process_ocr_sync, file_path, token)
+            raw_result = await process_ocr_async(file_path, token)
             
             if raw_result:
                 extracted_text = extract_text_from_result(raw_result)
@@ -108,12 +202,26 @@ async def ocr_worker(queue, db_path, on_success_callback, token):
                         on_success_callback()
                 else:
                     print(f"未能从 {file_path} 中提取到有效文字。")
+            else:
+                print(f"识别失败或超时，跳过: {file_path}")
             
             queue.task_done()
         except asyncio.CancelledError:
+            # 被取消时也要标记已完成，避免队列死锁
+            if file_path is not None:
+                try:
+                    queue.task_done()
+                except ValueError:
+                    pass
             break
         except Exception as e:
             print(f"处理任务时发生错误: {e}")
+            # 确保异常时也不会导致队列死锁
+            if file_path is not None:
+                try:
+                    queue.task_done()
+                except ValueError:
+                    pass
 
 # 接收顶级入口下发的凭据并分发给消费者协程
 async def run_backend(watch_dir, db_path, token, on_success_callback=None):
