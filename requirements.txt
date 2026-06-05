@@ -1,6 +1,5 @@
 PySide6
 requests
-aiohttp
 aiosqlite
 watchdog
 Markdown

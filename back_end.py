@@ -1,16 +1,17 @@
 import asyncio
 import json
 import os
-import aiohttp
+import requests
 import aiosqlite
 import time
+import traceback
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 MODEL = "PaddleOCR-VL-1.6"
 MAX_POLL_SECONDS = 300  # 轮询超时上限（秒）
-POLL_INTERVAL = 2      # 每次轮询间隔（秒）
+POLL_INTERVAL = 5      # 每次轮询间隔（秒），与官方样例一致
 
 class NewImageHandler(FileSystemEventHandler):
     def __init__(self, loop, queue):
@@ -32,11 +33,12 @@ class NewImageHandler(FileSystemEventHandler):
             self._last_processed[event.src_path] = current_time
             self.loop.call_soon_threadsafe(self.queue.put_nowait, event.src_path)
 
-# 异步方式提交OCR作业并轮询结果（1.6 作业提交+轮询模式）
-async def process_ocr_async(file_path, token):
+# 同步方式提交OCR作业并轮询结果（1.6 作业提交+轮询模式）
+# 严格对齐官方 sample-1.6.py 的请求格式，使用 requests 库
+def process_ocr_sync(file_path, token):
     try:
         if not os.path.exists(file_path):
-            print(f"错误: 文件不存在 {file_path}")
+            print(f"[诊断] 错误: 文件不存在 {file_path}")
             return None
 
         headers = {
@@ -48,106 +50,111 @@ async def process_ocr_async(file_path, token):
             "useChartRecognition": False,
         }
 
-        # 提交作业（本地文件模式）— 使用 aiohttp 真正异步上传
-        # 先同步读取文件内容（截图文件较小，不会阻塞事件循环）
+        # ===== 提交作业（本地文件模式，与官方样例完全一致）=====
+        data = {
+            "model": MODEL,
+            "optionalPayload": json.dumps(optional_payload)
+        }
+        
+        print(f"[诊断] ========== 开始OCR流程 ==========")
+        print(f"[诊断] 文件: {file_path}")
+        print(f"[诊断] 文件大小: {os.path.getsize(file_path)} bytes")
+        print(f"[诊断] API地址: {JOB_URL}")
+        print(f"[诊断] 模型: {MODEL}")
+        
         with open(file_path, "rb") as f:
-            file_content = f.read()
+            files = {"file": f}
+            print(f"[诊断] 正在提交作业...")
+            job_response = requests.post(JOB_URL, headers=headers, data=data, files=files)
 
-        data = aiohttp.FormData()
-        data.add_field("model", MODEL)
-        data.add_field("optionalPayload", json.dumps(optional_payload))
-        data.add_field(
-            "file",
-            file_content,
-            filename=os.path.basename(file_path),
-            content_type="application/octet-stream",
-        )
+        print(f"[诊断] 提交作业响应状态码: {job_response.status_code}")
+        print(f"[诊断] 提交作业响应体: {job_response.text[:1000]}")
 
-        async with aiohttp.ClientSession() as session:
-            # ---- 提交作业 ----
-            async with session.post(JOB_URL, headers=headers, data=data) as job_resp:
-                # 文件已上传，先读取响应文本
-                resp_text = await job_resp.text()
-                if job_resp.status != 200:
-                    print(f"提交作业失败 [{job_resp.status}]: {resp_text}")
-                    return None
-                try:
-                    job_json = json.loads(resp_text)
-                except json.JSONDecodeError:
-                    print(f"提交作业返回非法JSON: {resp_text[:500]}")
-                    return None
-
-            jobId = job_json.get("data", {}).get("jobId")
-            if not jobId:
-                print(f"提交作业响应缺少 jobId，完整响应: {resp_text[:500]}")
-                return None
-            print(f"作业已提交, job id: {jobId}")
-
-            # ---- 轮询作业状态 ----
-            start_time = time.monotonic()
-            while True:
-                elapsed = time.monotonic() - start_time
-                if elapsed > MAX_POLL_SECONDS:
-                    print(f"轮询超时（{MAX_POLL_SECONDS}秒），作业可能仍在处理中, job id: {jobId}")
-                    return None
-
-                async with session.get(f"{JOB_URL}/{jobId}", headers=headers) as poll_resp:
-                    if poll_resp.status != 200:
-                        poll_text = await poll_resp.text()
-                        print(f"查询作业状态失败 [{poll_resp.status}]: {poll_text[:300]}")
-                        return None
-                    jr_json = await poll_resp.json()
-
-                state = jr_json.get("data", {}).get("state", "unknown")
-
-                if state == "pending":
-                    print(f"作业状态: pending （已等待 {elapsed:.0f}s）")
-                elif state == "running":
-                    try:
-                        progress = jr_json["data"]["extractProgress"]
-                        print(f"作业状态: running, 总页数: {progress.get('totalPages', '?')}, "
-                              f"已提取: {progress.get('extractedPages', '?')}")
-                    except KeyError:
-                        print("作业状态: running...")
-                elif state == "done":
-                    jsonl_url = jr_json["data"]["resultUrl"]["jsonUrl"]
-                    print(f"作业完成, 正在下载结果...")
-                    break
-                elif state == "failed":
-                    error_msg = jr_json["data"].get("errorMsg", "未知错误")
-                    print(f"作业失败: {error_msg}")
-                    return None
-                else:
-                    print(f"作业状态未知: {state}, 响应: {json.dumps(jr_json, ensure_ascii=False)[:300]}")
-
-                await asyncio.sleep(POLL_INTERVAL)
-
-            # ---- 下载 JSONL 结果 ----
-            async with session.get(jsonl_url) as jsonl_resp:
-                if jsonl_resp.status != 200:
-                    print(f"下载结果失败 [{jsonl_resp.status}]")
-                    return None
-                jsonl_text = await jsonl_resp.text()
-
-            lines = jsonl_text.strip().split("\n")
-            # JSONL 每行一个 JSON 对象，结构为 {"result": {...}}，与旧版 API 返回一致
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    line_obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                result = line_obj.get("result")
-                if result and "layoutParsingResults" in result:
-                    return result
-
-            print("JSONL 结果中未找到有效的 layoutParsingResults")
+        if job_response.status_code != 200:
+            print(f"提交作业失败 [{job_response.status_code}]: {job_response.text}")
             return None
 
+        try:
+            job_json = job_response.json()
+        except json.JSONDecodeError:
+            print(f"[诊断] 提交作业返回非法JSON: {job_response.text[:500]}")
+            return None
+
+        jobId = job_json.get("data", {}).get("jobId")
+        if not jobId:
+            print(f"[诊断] 提交作业响应缺少 jobId，完整响应: {job_json}")
+            return None
+        print(f"[诊断] 作业已提交, job id: {jobId}")
+
+        # ===== 轮询作业状态 =====
+        start_time = time.monotonic()
+        poll_count = 0
+        while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed > MAX_POLL_SECONDS:
+                print(f"[诊断] 轮询超时（{MAX_POLL_SECONDS}秒），作业可能仍在处理中, job id: {jobId}")
+                return None
+
+            poll_count += 1
+            time.sleep(POLL_INTERVAL)
+            
+            poll_url = f"{JOB_URL}/{jobId}"
+            print(f"[诊断] 第{poll_count}次轮询 (已等待{elapsed:.1f}s) URL: {poll_url}")
+            job_result_response = requests.get(poll_url, headers=headers)
+            
+            print(f"[诊断] 轮询响应状态码: {job_result_response.status_code}")
+            print(f"[诊断] 轮询响应体: {job_result_response.text[:500]}")
+
+            if job_result_response.status_code != 200:
+                print(f"查询作业状态失败 [{job_result_response.status_code}]")
+                return None
+
+            jr_json = job_result_response.json()
+            state = jr_json.get("data", {}).get("state", "unknown")
+
+            if state == "pending":
+                print(f"作业状态: pending （已等待 {elapsed:.0f}s）")
+            elif state == "running":
+                try:
+                    progress = jr_json["data"]["extractProgress"]
+                    print(f"作业状态: running, 总页数: {progress.get('totalPages', '?')}, "
+                          f"已提取: {progress.get('extractedPages', '?')}")
+                except KeyError:
+                    print("作业状态: running...")
+            elif state == "done":
+                jsonl_url = jr_json["data"]["resultUrl"]["jsonUrl"]
+                print(f"[诊断] 作业完成, jsonl_url: {jsonl_url}")
+                break
+            elif state == "failed":
+                error_msg = jr_json["data"].get("errorMsg", "未知错误")
+                print(f"作业失败: {error_msg}")
+                return None
+            else:
+                print(f"[诊断] 作业状态未知: {state}, 完整响应: {json.dumps(jr_json, ensure_ascii=False)[:500]}")
+
+        # ===== 下载 JSONL 结果 =====
+        print(f"[诊断] 正在下载结果: {jsonl_url}")
+        jsonl_response = requests.get(jsonl_url)
+        jsonl_response.raise_for_status()
+        print(f"[诊断] 结果下载完成, 内容长度: {len(jsonl_response.text)} 字符")
+
+        lines = jsonl_response.text.strip().split("\n")
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            line_obj = json.loads(line)
+            result = line_obj.get("result")
+            if result and "layoutParsingResults" in result:
+                print(f"[诊断] ========== OCR流程成功完成 ==========")
+                return result
+
+        print("[诊断] JSONL 结果中未找到有效的 layoutParsingResults")
+        return None
+
     except Exception as e:
-        print(f"请求失败: {e}")
+        print(f"[诊断] 请求异常: {e}")
+        traceback.print_exc()
         return None
 
 async def init_db(db_path):
@@ -175,7 +182,7 @@ def extract_text_from_result(result_dict):
     
     return "\n".join(full_text)
 
-# 异步消费者协程：从队列取文件路径 → 异步调用OCR → 存库
+# 异步消费者协程：从队列取文件路径 → 用线程池运行同步OCR → 存库
 async def ocr_worker(queue, db_path, on_success_callback, token):
     
     while True:
@@ -184,7 +191,8 @@ async def ocr_worker(queue, db_path, on_success_callback, token):
             file_path = await queue.get()
             print(f"检测到新截图，开始识别: {file_path}")
             
-            raw_result = await process_ocr_async(file_path, token)
+            # 在线程池中运行同步请求，避免阻塞事件循环
+            raw_result = await asyncio.to_thread(process_ocr_sync, file_path, token)
             
             if raw_result:
                 extracted_text = extract_text_from_result(raw_result)
